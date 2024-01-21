@@ -1,67 +1,24 @@
-// SPDX-License-Identifier: GPL-2.0
-#include <argp.h>
+// SPDX-License-Identifier: (LGPL-2.1 OR BSD-2-Clause)
+/* Copyright (c) 2020 Facebook */
+#include <string.h>
 #include <signal.h>
 #include <stdio.h>
+#include <sys/types.h>
 #include <time.h>
+#include <stdint.h>
 #include <sys/resource.h>
 #include <bpf/libbpf.h>
-#include "goroutine.h"
-#include "goroutine.skel.h"
+#include <bpf/bpf.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include ".output/minimal_go_uprobe.skel.h"
+#include <inttypes.h>
+#include <argp.h>
+#define warn(...) fprintf(stderr, __VA_ARGS__)
 
-static struct env {
-	bool verbose;
-	long min_duration_ms;
-} env;
-
-const char *argp_program_version = "goroutine 0.0";
-const char *argp_program_bug_address = "<bpf@vger.kernel.org>";
-const char argp_program_doc[] =
-"BPF goroutine demo application.\n"
-"\n"
-"It traces process start and exits and shows associated \n"
-"information (filename, process duration, PID and PPID, etc).\n"
-"\n"
-"USAGE: ./goroutine [-d <min-duration-ms>] [-v]\n";
-
-static const struct argp_option opts[] = {
-	{ "verbose", 'v', NULL, 0, "Verbose debug output" },
-	{ "duration", 'd', "DURATION-MS", 0, "Minimum process duration (ms) to report" },
-	{},
-};
-
-static error_t parse_arg(int key, char *arg, struct argp_state *state)
+static int libbpf_print_fn(enum libbpf_print_level level, const char *format,
+			   va_list args)
 {
-	switch (key) {
-	case 'v':
-		env.verbose = true;
-		break;
-	case 'd':
-		errno = 0;
-		env.min_duration_ms = strtol(arg, NULL, 10);
-		if (errno || env.min_duration_ms <= 0) {
-			fprintf(stderr, "Invalid duration: %s\n", arg);
-			argp_usage(state);
-		}
-		break;
-	case ARGP_KEY_ARG:
-		argp_usage(state);
-		break;
-	default:
-		return ARGP_ERR_UNKNOWN;
-	}
-	return 0;
-}
-
-static const struct argp argp = {
-	.options = opts,
-	.parser = parse_arg,
-	.doc = argp_program_doc,
-};
-
-static int libbpf_print_fn(enum libbpf_print_level level, const char *format, va_list args)
-{
-	if (level == LIBBPF_DEBUG && !env.verbose)
-		return 0;
 	return vfprintf(stderr, format, args);
 }
 
@@ -72,42 +29,75 @@ static void sig_handler(int sig)
 	exiting = true;
 }
 
-static int handle_event(void *ctx, void *data, size_t data_sz)
+struct {
+	pid_t target_pid;
+	char exe_path[256];
+	int set;
+} env;
+
+static const struct argp_option opts[] = {
+	{ "pid", 'p', "PID", 0, "PID of the process to trace" },
+	{ "path", 'd', "PATH", 0, "Path of the executable path" },
+	{},
+};
+
+static error_t parse_arg(int key, char *arg, struct argp_state *state)
 {
-	const struct event *e = data;
-	struct tm *tm;
-	char ts[32];
-	time_t t;
+	switch (key) {
+	case 'p':
+		if (env.set) {
+			fprintf(stderr, "You may only set one of pid or path");
+			return ARGP_ERR_UNKNOWN;
+		}
 
-	time(&t);
-	tm = localtime(&t);
-	strftime(ts, sizeof(ts), "%H:%M:%S", tm);
-
-	if (e->exit_event) {
-		printf("%-8s %-5s %-16s %-7d %-7d [%u]",
-		       ts, "EXIT", e->comm, e->pid, e->ppid, e->exit_code);
-		if (e->duration_ns)
-			printf(" (%llums)", e->duration_ns / 1000000);
-		printf("\n");
-	} else {
-		printf("%-8s %-5s %-16s %-7d %-7d %s\n",
-		       ts, "EXEC", e->comm, e->pid, e->ppid, e->filename);
+		errno = 0;
+		env.target_pid = strtol(arg, NULL, 10);
+		if (errno || env.target_pid <= 0) {
+			fprintf(stderr, "Invalid pid: %s\n", arg);
+			argp_usage(state);
+		}
+		env.set = 1;
+		break;
+	case 'd':
+		if (env.set) {
+			fprintf(stderr, "You may only set one of pid or path");
+			return ARGP_ERR_UNKNOWN;
+		}
+		strcpy(env.exe_path, arg);
+		env.set = 2;
+		break;
+	case ARGP_KEY_ARG:
+		argp_usage(state);
+		break;
+	default:
+		return ARGP_ERR_UNKNOWN;
 	}
-
 	return 0;
 }
 
+const char argp_program_doc[] =
+	"Go uprobe demo.\n"
+	"\n"
+	"It traces runtime.casgstatus.\n"
+	"Specify the target pid through -p, or executable path through -d";
+
+static const struct argp argp = {
+	.options = opts,
+	.parser = parse_arg,
+	.doc = argp_program_doc,
+};
 int main(int argc, char **argv)
 {
-	struct ring_buffer *rb = NULL;
-	struct goroutine_bpf *skel;
+	struct minimal_go_uprobe_bpf *skel;
 	int err;
 
-	/* Parse command line arguments */
 	err = argp_parse(&argp, argc, argv, 0, NULL, NULL);
 	if (err)
 		return err;
-
+	if (!env.set) {
+		fprintf(stderr, "You must specify one of -d or -p\n");
+		return 1;
+	}
 	/* Set up libbpf errors and debug info callback */
 	libbpf_set_print(libbpf_print_fn);
 
@@ -116,57 +106,48 @@ int main(int argc, char **argv)
 	signal(SIGTERM, sig_handler);
 
 	/* Load and verify BPF application */
-	skel = goroutine_bpf__open();
+	skel = minimal_go_uprobe_bpf__open();
 	if (!skel) {
 		fprintf(stderr, "Failed to open and load BPF skeleton\n");
 		return 1;
 	}
 
-	/* Parameterize BPF code with minimum duration parameter */
-	skel->rodata->min_duration_ns = env.min_duration_ms * 1000000ULL;
-
 	/* Load & verify BPF programs */
-	err = goroutine_bpf__load(skel);
+	err = minimal_go_uprobe_bpf__load(skel);
 	if (err) {
 		fprintf(stderr, "Failed to load and verify BPF skeleton\n");
 		goto cleanup;
 	}
-
-	/* Attach tracepoints */
-	err = goroutine_bpf__attach(skel);
-	if (err) {
-		fprintf(stderr, "Failed to attach BPF skeleton\n");
+	LIBBPF_OPTS(bpf_uprobe_opts, attach_opts,
+		    .func_name = "runtime.casgstatus", .retprobe = false);
+	struct bpf_link *attach;
+	if (env.set == 1) {
+		sprintf(env.exe_path, "/proc/%d/exe", env.target_pid);
+		// Use PID
+		attach = bpf_program__attach_uprobe_opts(
+			skel->progs.go_trace_test, env.target_pid, env.exe_path,
+			0, &attach_opts);
+	} else if (env.set == 2) {
+		attach = bpf_program__attach_uprobe_opts(
+			skel->progs.go_trace_test, -1, env.exe_path, 0,
+			&attach_opts);
+	} else {
+		fprintf(stderr, "You must specify one of -d or -p");
 		goto cleanup;
 	}
-
-	/* Set up ring buffer polling */
-	rb = ring_buffer__new(bpf_map__fd(skel->maps.rb), handle_event, NULL, NULL);
-	if (!rb) {
+	if (!attach) {
+		fprintf(stderr, "Failed to attach BPF skeleton: %d\n", errno);
 		err = -1;
-		fprintf(stderr, "Failed to create ring buffer\n");
 		goto cleanup;
 	}
-
-	/* Process events */
-	printf("%-8s %-5s %-16s %-7s %-7s %s\n",
-	       "TIME", "EVENT", "COMM", "PID", "PPID", "FILENAME/EXIT CODE");
 	while (!exiting) {
-		err = ring_buffer__poll(rb, 100 /* timeout, ms */);
-		/* Ctrl-C will cause -EINTR */
-		if (err == -EINTR) {
-			err = 0;
-			break;
-		}
-		if (err < 0) {
-			printf("Error polling perf buffer: %d\n", err);
-			break;
-		}
+		sleep(1);
+		puts("See /sys/kernel/tracing/trace_pipe for output");
+		fflush(stdout);
 	}
-
 cleanup:
 	/* Clean up */
-	ring_buffer__free(rb);
-	goroutine_bpf__destroy(skel);
+	minimal_go_uprobe_bpf__destroy(skel);
 
 	return err < 0 ? -err : 0;
 }
